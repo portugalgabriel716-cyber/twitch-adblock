@@ -1,15 +1,16 @@
 (() => {
-  const api = globalThis.browser ?? globalThis.chrome;
+  const api = globalThis.chrome ?? globalThis.browser;
   if (!api?.storage?.local) {
     return;
   }
 
   const watchdogInfoKey = "watchdogInfo";
   const checkIntervalMs = 2000;
-  const stallThresholdMs = 15000;
-  const cooldownMs = 120000;
-  const preflightMs = 20000;
-  const pausePlayDelayMs = 250;
+  const stallThresholdMs = 12000;
+  const recoveryCooldownMs = 30000;
+  const healthyResetMs = 60000;
+  const preflightMs = 15000;
+  const maxPlayerReloads = 2;
 
   let extensionEnabled = true;
   let watchdogEnabled = true;
@@ -19,9 +20,9 @@
   let lastProgressAt = Date.now();
   let lastRecoveryAt = 0;
   let recoveryCount = 0;
-  let recoveryInProgress = false;
+  let isBlockingAd = false;
   let lastUrl = window.location.href;
-  const pageLoadTime = Number(performance?.timeOrigin) || Date.now();
+  let lastNavigationAt = Date.now();
   let lastPublishedSignature = "";
   let currentInfo = {
     status: "starting",
@@ -30,60 +31,23 @@
     url: window.location.href
   };
 
-  const storageGet = (defaults) =>
-    new Promise((resolve) => {
-      try {
-        const maybePromise = api.storage.local.get(defaults, (items) => {
-          if (api.runtime?.lastError) {
-            resolve(defaults);
-            return;
-          }
-          resolve(items || defaults);
-        });
-        if (maybePromise && typeof maybePromise.then === "function") {
-          maybePromise.then(resolve).catch(() => resolve(defaults));
-        }
-      } catch {
-        resolve(defaults);
-      }
-    });
-
-  const storageSet = (values) =>
-    new Promise((resolve) => {
-      try {
-        const maybePromise = api.storage.local.set(values, () => {
-          resolve();
-        });
-        if (maybePromise && typeof maybePromise.then === "function") {
-          maybePromise.then(resolve).catch(resolve);
-        }
-      } catch {
-        resolve();
-      }
-    });
-
-  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
   const shouldWatch = () => extensionEnabled && watchdogEnabled;
 
   const publishInfo = (update, force) => {
-    const nextInfoWithoutTimestamp = {
+    const next = {
       ...currentInfo,
       ...update,
       url: window.location.href,
       watchdogEnabled,
       extensionEnabled
     };
-    const signature = JSON.stringify(nextInfoWithoutTimestamp);
+    const signature = JSON.stringify(next);
     if (!force && signature === lastPublishedSignature) {
       return;
     }
     lastPublishedSignature = signature;
-    currentInfo = {
-      ...nextInfoWithoutTimestamp,
-      lastUpdated: Date.now()
-    };
-    storageSet({ [watchdogInfoKey]: currentInfo });
+    currentInfo = { ...next, lastUpdated: Date.now() };
+    api.storage.local.set({ [watchdogInfoKey]: currentInfo }).catch(() => {});
   };
 
   const describeStatus = () => {
@@ -96,67 +60,42 @@
     return "waiting_for_video";
   };
 
-  const resetTrackingForVideo = (video) => {
-    activeVideo = video;
+  const resetProgress = (video) => {
     lastCurrentTime = Number(video?.currentTime) || 0;
     lastProgressAt = Date.now();
   };
 
   const pickVideo = () => {
-    const videos = Array.from(document.querySelectorAll("video"));
-    if (!videos.length) {
-      return null;
+    let best = null;
+    let bestArea = -1;
+    for (const video of document.querySelectorAll("video")) {
+      const area = (video.clientWidth || 0) * (video.clientHeight || 0);
+      if (area > bestArea) {
+        best = video;
+        bestArea = area;
+      }
     }
-    videos.sort((a, b) => {
-      const aArea = (a.clientWidth || 0) * (a.clientHeight || 0);
-      const bArea = (b.clientWidth || 0) * (b.clientHeight || 0);
-      return bArea - aArea;
-    });
-    return videos[0] || null;
+    return best;
   };
 
-  const markMonitoring = () => {
-    publishInfo({
-      status: "monitoring",
-      recoveryCount,
-      stallMs: 0
-    });
-  };
-
-  const recoverPlayback = async (stallMs) => {
-    if (recoveryInProgress) {
-      return;
-    }
-    recoveryInProgress = true;
+  // Escalation: ask the engine for a Twitch player reload (keeps quality/volume and the
+  // player's internal state consistent), and only reload the whole tab as a last resort.
+  const recoverPlayback = (stallMs) => {
     recoveryCount += 1;
     lastRecoveryAt = Date.now();
+    const reason = `stalled_${Math.round(stallMs / 1000)}s`;
 
-    if (recoveryCount === 1) {
+    if (recoveryCount <= maxPlayerReloads) {
       publishInfo({
         status: "recovering",
         recoveryCount,
         stallMs,
         lastRecoveryAt,
-        lastRecoveryAction: "pause_play",
-        lastRecoveryReason: `stalled_${Math.round(stallMs / 1000)}s`
+        lastRecoveryAction: "player_reload",
+        lastRecoveryReason: reason
       });
-      try {
-        activeVideo?.pause();
-      } catch {
-        // Ignore player pause errors.
-      }
-      await sleep(pausePlayDelayMs);
-      try {
-        const maybePromise = activeVideo?.play?.();
-        if (maybePromise && typeof maybePromise.catch === "function") {
-          maybePromise.catch(() => {});
-        }
-      } catch {
-        // Ignore player play errors.
-      }
+      window.postMessage({ source: "twitchadsblocker-watchdog", action: "reloadPlayer" }, "*");
       lastProgressAt = Date.now();
-      markMonitoring();
-      recoveryInProgress = false;
       return;
     }
 
@@ -166,13 +105,12 @@
       stallMs,
       lastRecoveryAt,
       lastRecoveryAction: "tab_reload",
-      lastRecoveryReason: `stalled_${Math.round(stallMs / 1000)}s`
+      lastRecoveryReason: reason
     });
-    await sleep(50);
-    window.location.reload();
+    setTimeout(() => window.location.reload(), 50);
   };
 
-  const tick = async () => {
+  const tick = () => {
     if (!initialized) {
       return;
     }
@@ -185,15 +123,15 @@
     const currentUrl = window.location.href;
     if (currentUrl !== lastUrl) {
       lastUrl = currentUrl;
+      lastNavigationAt = Date.now();
       recoveryCount = 0;
-      recoveryInProgress = false;
       lastRecoveryAt = 0;
       activeVideo = null;
       lastCurrentTime = null;
       lastProgressAt = Date.now();
     }
 
-    if (Date.now() - pageLoadTime < preflightMs) {
+    if (Date.now() - lastNavigationAt < preflightMs) {
       publishInfo({ status: "warming_up", recoveryCount, stallMs: 0 });
       return;
     }
@@ -207,65 +145,72 @@
     }
 
     if (video !== activeVideo) {
-      resetTrackingForVideo(video);
-      markMonitoring();
+      activeVideo = video;
+      resetProgress(video);
+      publishInfo({ status: "monitoring", recoveryCount, stallMs: 0 });
       return;
     }
 
-    if (video.paused || video.ended || video.readyState < 2) {
-      lastProgressAt = Date.now();
-      lastCurrentTime = Number(video.currentTime) || 0;
+    // Paused/ended by the user is not a stall. A low readyState while *playing* is exactly
+    // what a buffering stall looks like, so it must not be treated as idle.
+    if (video.paused || video.ended) {
+      resetProgress(video);
       publishInfo({ status: "idle", recoveryCount, stallMs: 0 });
       return;
     }
 
     const currentTime = Number(video.currentTime) || 0;
     if (lastCurrentTime === null || currentTime > lastCurrentTime + 0.01) {
-      if (recoveryCount > 0 && lastCurrentTime !== null) {
-        recoveryCount = 0;
-      }
       lastCurrentTime = currentTime;
       lastProgressAt = Date.now();
-      markMonitoring();
+      if (recoveryCount > 0 && Date.now() - lastRecoveryAt > healthyResetMs) {
+        recoveryCount = 0;
+      }
+      publishInfo({ status: "monitoring", recoveryCount, stallMs: 0 });
       return;
     }
 
     const stallMs = Date.now() - lastProgressAt;
-    publishInfo({ status: "monitoring", recoveryCount, stallMs });
-    if (stallMs < stallThresholdMs) {
+    publishInfo({ status: "monitoring", recoveryCount, stallMs: Math.round(stallMs / 1000) * 1000 });
+    // Reloading during an ad break just lands back in the same ad; let the engine finish it.
+    if (isBlockingAd || stallMs < stallThresholdMs || Date.now() - lastRecoveryAt < recoveryCooldownMs) {
       return;
     }
-    if (Date.now() - lastRecoveryAt < cooldownMs) {
-      return;
+
+    recoverPlayback(stallMs);
+  };
+
+  window.addEventListener("message", (event) => {
+    const data = event.data;
+    if (event.source === window && data && data.source === "twitchadsblocker-state") {
+      isBlockingAd = Boolean(data.hasAds);
+      if (!isBlockingAd) {
+        lastProgressAt = Date.now();
+      }
     }
+  });
 
-    await recoverPlayback(stallMs);
-  };
-
-  const initialize = async () => {
-    const state = await storageGet({ enabled: true, watchdogEnabled: true });
-    extensionEnabled = state.enabled !== false;
-    watchdogEnabled = state.watchdogEnabled !== false;
-    initialized = true;
-    publishInfo({ status: describeStatus(), recoveryCount, stallMs: 0 }, true);
-  };
-
-  initialize();
-  setInterval(() => {
-    tick();
-  }, checkIntervalMs);
-
-  if (api.storage?.onChanged?.addListener) {
-    api.storage.onChanged.addListener((changes, areaName) => {
-      if (areaName !== "local") {
-        return;
-      }
-      if (Object.prototype.hasOwnProperty.call(changes, "enabled")) {
-        extensionEnabled = changes.enabled.newValue !== false;
-      }
-      if (Object.prototype.hasOwnProperty.call(changes, "watchdogEnabled")) {
-        watchdogEnabled = changes.watchdogEnabled.newValue !== false;
-      }
+  api.storage.local
+    .get({ enabled: true, watchdogEnabled: true })
+    .catch(() => ({}))
+    .then((state) => {
+      extensionEnabled = state.enabled !== false;
+      watchdogEnabled = state.watchdogEnabled !== false;
+      initialized = true;
+      publishInfo({ status: describeStatus(), recoveryCount, stallMs: 0 }, true);
     });
-  }
+
+  setInterval(tick, checkIntervalMs);
+
+  api.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName !== "local") {
+      return;
+    }
+    if (Object.prototype.hasOwnProperty.call(changes, "enabled")) {
+      extensionEnabled = changes.enabled.newValue !== false;
+    }
+    if (Object.prototype.hasOwnProperty.call(changes, "watchdogEnabled")) {
+      watchdogEnabled = changes.watchdogEnabled.newValue !== false;
+    }
+  });
 })();

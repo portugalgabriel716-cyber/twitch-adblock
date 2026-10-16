@@ -1,141 +1,56 @@
+// Isolated-world bridge: the engine and the conflict detector run in the page (MAIN world)
+// and cannot touch extension storage, so they post messages that are persisted here.
 (() => {
-  const scriptId = "twitchadsblocker-vaft";
-  const detectorScriptId = "twitchadsblocker-conflict-detector-script";
-  const conflictStorageKey = "conflictInfo";
-  const detectorSource = "twitchadsblocker-conflict-detector";
-  const detectorTimeoutMs = 1500;
-  const api = globalThis.browser ?? globalThis.chrome;
-  if (!api?.runtime?.getURL) {
+  const api = globalThis.chrome ?? globalThis.browser;
+  if (!api?.storage?.local) {
     return;
   }
 
-  const inject = () => {
-    if (document.getElementById(scriptId)) {
-      return;
+  const conflictStorageKey = "conflictInfo";
+  const detectorSource = "twitchadsblocker-conflict-detector";
+  const adBlockedSource = "twitchadsblocker-ad-blocked";
+
+  let pendingAdsBlocked = 0;
+  let flushScheduled = false;
+
+  const flushAdsBlocked = async () => {
+    flushScheduled = false;
+    const increment = pendingAdsBlocked;
+    pendingAdsBlocked = 0;
+    try {
+      const { adsBlocked } = await api.storage.local.get({ adsBlocked: 0 });
+      await api.storage.local.set({ adsBlocked: (Number(adsBlocked) || 0) + increment });
+    } catch {
+      // Extension context invalidated (extension reloaded) — nothing to persist to.
     }
-    const script = document.createElement("script");
-    script.id = scriptId;
-    script.src = api.runtime.getURL("injected/vaft.js");
-    script.async = false;
-    (document.head || document.documentElement).appendChild(script);
   };
 
-  const storageSet = (values) =>
-    new Promise((resolve) => {
-      try {
-        const maybePromise = api.storage.local.set(values, () => {
-          resolve();
-        });
-        if (maybePromise && typeof maybePromise.then === "function") {
-          maybePromise.then(resolve).catch(resolve);
-        }
-      } catch {
-        resolve();
-      }
-    });
-
-  const getEnabled = () =>
-    new Promise((resolve) => {
-      try {
-        const maybePromise = api.storage.local.get({ enabled: true }, (items) => {
-          if (api.runtime?.lastError) {
-            resolve(true);
-            return;
-          }
-          resolve(items?.enabled !== false);
-        });
-        if (maybePromise && typeof maybePromise.then === "function") {
-          maybePromise
-            .then((items) => resolve(items?.enabled !== false))
-            .catch(() => resolve(true));
-        }
-      } catch {
-        resolve(true);
-      }
-    });
-
-  const runConflictDetection = () =>
-    new Promise((resolve) => {
-      const requestId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-      let settled = false;
-      let timeoutId = null;
-      const detectorScript = document.createElement("script");
-
-      const finish = (result) => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        if (timeoutId) {
-          clearTimeout(timeoutId);
-        }
-        window.removeEventListener("message", onMessage);
-        detectorScript.remove();
-        resolve(result);
-      };
-
-      const onMessage = (event) => {
-        const data = event.data;
-        if (
-          event.source !== window ||
-          !data ||
-          data.source !== detectorSource ||
-          data.requestId !== requestId
-        ) {
-          return;
-        }
-
-        finish({
-          hasConflict: Boolean(data.hasConflict),
-          markers: Array.isArray(data.markers) ? data.markers : [],
-          checkedAt: Number(data.checkedAt) || Date.now(),
-          url: typeof data.url === "string" ? data.url : window.location.href
-        });
-      };
-
-      window.addEventListener("message", onMessage);
-      timeoutId = setTimeout(() => {
-        finish({
-          hasConflict: false,
-          markers: [],
-          checkedAt: Date.now(),
-          url: window.location.href,
-          status: "timeout"
-        });
-      }, detectorTimeoutMs);
-
-      detectorScript.id = detectorScriptId;
-      detectorScript.src = api.runtime.getURL("injected/conflict-detector.js");
-      detectorScript.async = false;
-      detectorScript.dataset.requestId = requestId;
-      (document.head || document.documentElement).appendChild(detectorScript);
-    });
-
   window.addEventListener("message", (event) => {
-    if (
-      event.source !== window ||
-      !event.data ||
-      event.data.source !== "twitchadsblocker-ad-blocked"
-    ) {
+    const data = event.data;
+    if (event.source !== window || !data || typeof data.source !== "string") {
       return;
     }
-    try {
-      const maybePromise = api.storage.local.get({ adsBlocked: 0 }, (items) => {
-        if (api.runtime?.lastError) return;
-        api.storage.local.set({ adsBlocked: (items.adsBlocked || 0) + 1 });
-      });
-      if (maybePromise && typeof maybePromise.then === "function") {
-        maybePromise.then((items) => {
-          api.storage.local.set({ adsBlocked: (items.adsBlocked || 0) + 1 });
-        });
-      }
-    } catch {}
-  });
 
-  Promise.all([getEnabled(), runConflictDetection()]).then(([enabled, conflictInfo]) => {
-    storageSet({ [conflictStorageKey]: conflictInfo });
-    if (enabled) {
-      inject();
+    if (data.source === adBlockedSource) {
+      pendingAdsBlocked += 1;
+      if (!flushScheduled) {
+        flushScheduled = true;
+        setTimeout(flushAdsBlocked, 500);
+      }
+      return;
+    }
+
+    if (data.source === detectorSource) {
+      api.storage.local
+        .set({
+          [conflictStorageKey]: {
+            hasConflict: Boolean(data.hasConflict),
+            markers: Array.isArray(data.markers) ? data.markers : [],
+            checkedAt: Number(data.checkedAt) || Date.now(),
+            url: typeof data.url === "string" ? data.url : window.location.href
+          }
+        })
+        .catch(() => {});
     }
   });
 })();

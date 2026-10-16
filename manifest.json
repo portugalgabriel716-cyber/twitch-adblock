@@ -1,12 +1,26 @@
 {
   "manifest_version": 3,
   "name": "Twitch Ads Blocker (VAFT Wrapper)",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Runs the VAFT Twitch ad-block engine automatically on twitch.tv with no uBlock/userscript setup.",
   "permissions": [
     "storage",
-    "tabs"
+    "tabs",
+    "scripting"
   ],
+  "host_permissions": [
+    "*://*.twitch.tv/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "scripts": ["background.js"]
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "twitch-ads-blocker@gabrielcatarini",
+      "strict_min_version": "128.0"
+    }
+  },
   "icons": {
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
@@ -30,17 +44,6 @@
         "watchdog.js"
       ],
       "run_at": "document_start"
-    }
-  ],
-  "web_accessible_resources": [
-    {
-      "resources": [
-        "injected/conflict-detector.js",
-        "injected/vaft.js"
-      ],
-      "matches": [
-        "*://*.twitch.tv/*"
-      ]
     }
   ]
 }

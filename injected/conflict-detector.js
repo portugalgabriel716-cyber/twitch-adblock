@@ -1,8 +1,7 @@
+// Runs in the page (MAIN world) at document_idle, after the engine has had its chance to hook.
 (() => {
-  const currentScript = document.currentScript;
-  const requestId = currentScript?.dataset?.requestId || "";
   const source = "twitchadsblocker-conflict-detector";
-  const ownScriptPresent = Boolean(document.getElementById("twitchadsblocker-vaft"));
+  const ownEngineActive = window.__twitchAdsBlockerActive === true;
   const markers = [];
 
   const addMarker = (name, details) => {
@@ -10,7 +9,8 @@
   };
 
   try {
-    if (!ownScriptPresent && typeof window.twitchAdSolutionsVersion !== "undefined") {
+    // Another VAFT/TwitchAdSolutions copy got there first, so ours skipped itself.
+    if (!ownEngineActive && typeof window.twitchAdSolutionsVersion !== "undefined") {
       addMarker(
         "twitchAdSolutionsVersion",
         `window.twitchAdSolutionsVersion=${String(window.twitchAdSolutionsVersion)}`
@@ -21,34 +21,25 @@
   }
 
   try {
+    // Our hooked Worker class contains "twitchBlobUrl"; anything else non-native is a foreign hook.
     const workerString = Function.prototype.toString.call(window.Worker);
-    const workerLooksPatched = !workerString.includes("[native code]");
-    if (!ownScriptPresent && workerLooksPatched) {
-      addMarker(
-        "workerPatched",
-        workerString.slice(0, 140)
-      );
+    const isNative = workerString.includes("[native code]");
+    const isOurs = workerString.includes("twitchBlobUrl");
+    if (!isNative && !isOurs) {
+      addMarker("workerPatched", workerString.slice(0, 140));
     }
   } catch {
     // Ignore if Worker cannot be inspected.
   }
 
-  try {
-    if (document.querySelector('[data-a-target="video-ad-label"]')) {
-      addMarker("adLabelVisible", "Twitch ad label present in DOM");
-    }
-  } catch {
-    // Ignore DOM query failures.
-  }
-
-  const payload = {
-    source,
-    requestId,
-    hasConflict: markers.length > 0,
-    markers,
-    checkedAt: Date.now(),
-    url: window.location.href
-  };
-
-  window.postMessage(payload, "*");
+  window.postMessage(
+    {
+      source,
+      hasConflict: markers.length > 0,
+      markers,
+      checkedAt: Date.now(),
+      url: window.location.href
+    },
+    "*"
+  );
 })();
